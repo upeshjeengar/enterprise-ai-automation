@@ -60,7 +60,7 @@ def main() -> int:
             want = set(c["expect_approvers"])
             match = want.issubset(got)
             ok &= match
-            detail.append(f"approvers {'⊇' if match else '⊉'} {sorted(want)} (got {sorted(got)})")
+            detail.append(f"approvers {'contains' if match else 'missing'} {sorted(want)} (got {sorted(got)})")
 
         if "expect_type" in c:
             got = (res.get("workflow") or {}).get("workflow_type")
@@ -72,7 +72,7 @@ def main() -> int:
             got = [t["tool_name"] for t in res.get("tool_calls", []) if t["status"] == "executed"]
             match = all(t in got for t in c["expect_tools"])
             ok &= match
-            detail.append(f"tools {'⊇' if match else '⊉'} {c['expect_tools']} (got {got})")
+            detail.append(f"tools {'contains' if match else 'missing'} {c['expect_tools']} (got {got})")
 
         if c.get("expect_no_approvers"):
             got = [a["approver_role"] for a in res.get("approvals", [])]

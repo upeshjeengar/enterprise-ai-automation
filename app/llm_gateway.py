@@ -13,6 +13,7 @@ import httpx
 from . import config
 
 _TIMEOUT = httpx.Timeout(120.0, connect=15.0)
+_EMBEDDING_BACKEND = "nim" if config.has_api_key() else "offline"
 
 
 class LLMError(RuntimeError):
@@ -68,7 +69,11 @@ def chat(
             last_err = LLMError(f"NIM {r.status_code}: {r.text[:300]}")
         except Exception as e:  # noqa: BLE001 - surface after retries
             last_err = e
-    raise LLMError(f"chat failed after retries: {last_err}")
+    # The governance path must remain available when a configured NIM endpoint
+    # is unavailable. Returning an empty completion lets callers use their
+    # existing deterministic/grounded fallback rather than failing the whole
+    # workflow.
+    return ""
 
 
 def chat_json(
@@ -96,7 +101,9 @@ def chat_json(
 
 def embed(texts: list[str], *, input_type: str = "passage") -> list[list[float]]:
     """Return embedding vectors. Falls back to a hashing embedder offline."""
+    global _EMBEDDING_BACKEND
     if not config.has_api_key():
+        _EMBEDDING_BACKEND = "offline"
         return [_offline_embed(t) for t in texts]
 
     payload = {
@@ -106,14 +113,26 @@ def embed(texts: list[str], *, input_type: str = "passage") -> list[list[float]]
         "encoding_format": "float",
         "truncate": "END",
     }
-    with httpx.Client(timeout=_TIMEOUT) as client:
-        r = client.post(
-            f"{config.NIM_BASE_URL}/embeddings", headers=_headers(), json=payload
-        )
-    if r.status_code != 200:
-        raise LLMError(f"embeddings {r.status_code}: {r.text[:300]}")
-    data = r.json()["data"]
-    return [row["embedding"] for row in data]
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as client:
+            r = client.post(
+                f"{config.NIM_BASE_URL}/embeddings", headers=_headers(), json=payload
+            )
+        if r.status_code == 200:
+            _EMBEDDING_BACKEND = "nim"
+            data = r.json()["data"]
+            return [row["embedding"] for row in data]
+    except httpx.HTTPError:
+        pass
+    # Preserve retrieval availability if a key is configured but NIM is down,
+    # misconfigured, or temporarily unreachable.
+    _EMBEDDING_BACKEND = "offline"
+    return [_offline_embed(t) for t in texts]
+
+
+def embedding_backend() -> str:
+    """Return the backend that produced the most recent embedding batch."""
+    return _EMBEDDING_BACKEND
 
 
 # --------------------------------------------------------------------------- #

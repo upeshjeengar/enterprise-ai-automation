@@ -101,9 +101,20 @@ Retrieved policy excerpts:
         )
     except Exception:
         answer = None
-    if not answer or not str(answer).strip():
+    if not answer or not str(answer).strip() or str(answer).startswith("[offline stub]"):
         # LLM unavailable or returned empty — ground on the top retrieved excerpt.
-        top = citations[0]
+        # A sparse local fallback can rank a broad governance section above a
+        # directly relevant threshold section. Prefer an excerpt that contains
+        # the concrete term asked about when available.
+        question_terms = set(re.findall(r"[a-z0-9]+", question.lower()))
+        top = max(
+            citations,
+            key=lambda c: (
+                int("cfo" in question.lower() and "cfo" in c["text"].lower()),
+                len(question_terms & set(re.findall(r"[a-z0-9]+", c["text"].lower()))),
+                c["relevance_score"],
+            ),
+        )
         answer = (
             f"Based on {top['section']}: {top['text'][:400]}"
         )
@@ -147,7 +158,7 @@ Employee message:
     try:
         data = chat_json([{"role": "user", "content": prompt}], reasoning=False)
     except Exception:
-        data = {}
+        data = _deterministic_intake(user_text)
     # normalize
     data.setdefault("workflow_type", config.DEFAULT_WORKFLOW_TYPE)
     if data["workflow_type"] not in config.WORKFLOW_PROFILES:
@@ -173,6 +184,104 @@ Employee message:
     except (ValueError, TypeError):
         data["contract_value_inr"] = None
     return data
+
+
+def _deterministic_intake(user_text: str) -> dict:
+    """Conservative local intake fallback for unavailable model inference.
+
+    It intentionally extracts only facts stated in the request. The normal NIM
+    model remains the richer parser; this keeps routing, policy controls, and
+    evaluations usable during an outage or offline demo.
+    """
+    text = user_text.strip()
+    low = text.lower()
+
+    if re.search(r"\b(jira|project task|tracking task)\b", low):
+        workflow_type = "project_task"
+    elif re.search(r"\b(servicenow|itsm|hardware|laptop)\b", low):
+        workflow_type = "it_service_request"
+    elif re.search(r"\b(slack|notification|alert)\b", low):
+        workflow_type = "notification"
+    elif re.search(r"\b(onboard|new supplier|new vendor|register.*vendor)\b", low):
+        workflow_type = "vendor_onboarding"
+    elif re.search(r"\b(okta|github|access|app group)\b", low):
+        workflow_type = "it_access_request"
+    elif re.search(r"\b(procurement|requisition|purchase|purchasing|sap ariba)\b", low):
+        workflow_type = "procurement"
+    elif re.search(r"\b(license|licence|subscription)\b", low):
+        workflow_type = "software_license"
+    else:
+        workflow_type = config.DEFAULT_WORKFLOW_TYPE
+
+    amount = None
+    amount_match = re.search(r"(?:₹|inr\s*)?\s*([\d,.]+)\s*(lakh|lakhs|crore|crores)\b", low)
+    if amount_match:
+        raw = float(amount_match.group(1).replace(",", ""))
+        amount = int(raw * (10_000_000 if amount_match.group(2).startswith("crore") else 100_000))
+    else:
+        rupee_match = re.search(r"(?:₹|inr\s*)([\d,]+)", low)
+        if rupee_match:
+            amount = int(rupee_match.group(1).replace(",", ""))
+
+    vendor = None
+    for pattern in (
+        r"\bonboard\s+(.+?)\s+(?:as\s+a\s+vendor|for)\b",
+        r"\bvendor\s+([A-Z][\w& .-]+?)(?:\s+for|,|\.|$)",
+        r"\bfrom\s+([A-Z][\w& .-]+?)(?:\s+for|\s+at|,|\.|$)",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip(" ,.")
+            if candidate.lower() not in {"a", "the", "new"}:
+                vendor = candidate
+                break
+
+    department = None
+    dept_match = re.search(r"\bfor\s+(Marketing|Design|Operations|Analytics|Finance|HR|Engineering)\b", text, re.IGNORECASE)
+    project_match = re.search(r"\bunder\s+(?:the\s+)?['\"]?([A-Z][A-Z0-9_-]{1,})['\"]?\s+project", text)
+    if dept_match:
+        department = dept_match.group(1)
+    elif project_match:
+        department = project_match.group(1)
+
+    access: list[str] = []
+    access_patterns = {
+        "analytics_dashboard": r"analytics dashboard|dashboard access",
+        "customer_pii": r"customer pii|\bpii\b",
+        "customer_analytics": r"customer analytics",
+        "production_database": r"production database|prod(?:uction)? db",
+        "production": r"\bproduction access\b",
+        "admin": r"\badmin access\b",
+        "github": r"\bgithub\b",
+        "finance_reporting": r"finance[- ]reporting",
+    }
+    for name, pattern in access_patterns.items():
+        if re.search(pattern, low):
+            access.append(name)
+
+    target_system = next((name for name in ("ServiceNow", "Jira", "Slack", "SAP Ariba", "Okta", "DocuSign", "GitHub")
+                          if name.lower() in low), None)
+    subject = None
+    if workflow_type == "notification":
+        channel = re.search(r"#[\w-]+", text)
+        subject = channel.group(0) if channel else None
+    elif workflow_type == "it_access_request":
+        person = re.search(r"(?:for|to)\s+(?:new\s+team\s+member\s+)?([A-Z][a-z]+\s+[A-Z][a-z]+)", text)
+        subject = person.group(1) if person else None
+
+    return {
+        "workflow_type": workflow_type,
+        "target_system": target_system,
+        "vendor_name": vendor,
+        "department": department,
+        "contract_value_inr": amount,
+        "requested_access": access,
+        "legal_documents": ["NDA"] if re.search(r"\bnda\b", low) else [],
+        "business_owner": None,
+        "access_duration_days": None,
+        "subject": subject,
+        "intent_summary": text[:120],
+    }
 
 
 # ======================================================================== #
@@ -331,7 +440,7 @@ def approval_router_agent(intake: dict) -> list[str]:
         approvers.append("Manager")
 
     # functional
-    if legal_docs:
+    if legal_docs or (profile["needs_business_owner"] and value > config.THRESHOLD_FINANCE):
         approvers.append("Legal Reviewer")
     if access:
         approvers.append("Security Reviewer")

@@ -12,6 +12,75 @@ It turns a plain-English employee request into a **governed, auditable workflow*
 
 ---
 
+## End-to-end workflow
+
+```mermaid
+flowchart TD
+    USER["Employee message<br/>request or policy question"] --> INPUT{"Input rail<br/>deterministic safety patterns"}
+
+    INPUT -->|"Policy bypass, unsafe immediate access,<br/>payment approval, skipped review"| BLOCK_INTAKE["Intake record<br/>workflow + audit event"]
+    BLOCK_INTAKE --> POLICY_BLOCKED["POLICY_BLOCKED<br/>No tool execution"]
+
+    INPUT -->|"Clean"| INTENT{"Intent classifier<br/>deterministic regex"}
+    INTENT -->|"Informational question"| QA_QUERY
+    INTENT -->|"Action / imperative request"| INTAKE
+
+    subgraph QA["Policy Q&A path — no workflow side effects"]
+        QA_QUERY["Build query from employee question"]
+        QA_QUERY --> QA_EMBED["Create query embedding<br/>Primary: NVIDIA nv-embedqa-e5-v5<br/>Fallback: local 1024-dim hashing embedder"]
+        QA_EMBED --> QA_STORE["Search internal policy embeddings<br/>storage/policy_vectors.npz<br/>cosine similarity · top 5 sections"]
+        QA_STORE --> QA_CONTEXT["Context: question + retrieved policy excerpts"]
+        QA_CONTEXT --> QA_MODEL["Policy Q&A agent<br/>REASONING_MODEL: nvidia/llama-3.3-nemotron-super-49b-v1.5"]
+        QA_MODEL -->|"NIM answer available"| QA_DONE["ANSWERED<br/>grounded answer + citations"]
+        QA_MODEL -->|"NIM unavailable or empty"| QA_FALLBACK["Deterministic fallback<br/>best matching retrieved policy excerpt"]
+        QA_FALLBACK --> QA_DONE
+    end
+
+    subgraph ACTION["Action workflow path"]
+        INTAKE["Intake agent<br/>FAST_MODEL: meta/llama-3.1-8b-instruct<br/>Context: raw employee request"]
+        INTAKE -->|"NIM JSON available"| STRUCTURED["Structured request<br/>type · vendor · amount · access · NDA<br/>department · target system · summary"]
+        INTAKE -->|"NIM unavailable / invalid JSON"| LOCAL_INTAKE["Deterministic intake fallback<br/>conservative regex fact extraction"]
+        LOCAL_INTAKE --> STRUCTURED
+        STRUCTURED --> DRAFT["Persist workflow<br/>DRAFT + audit events"]
+        DRAFT --> REQUIRED{"Profile-required fields present?<br/>Depends on workflow type"}
+        REQUIRED -->|"No"| INFO_REQUIRED["INFO_REQUIRED<br/>Ask only for required fields"]
+        REQUIRED -->|"Yes"| PLAN["Planning agent<br/>deterministic 6-step plan"]
+
+        PLAN --> RAG_QUERY["Build policy-retrieval query<br/>request + summary + access + NDA + spend terms"]
+        RAG_QUERY --> ACTION_EMBED["Create query embedding<br/>NVIDIA nv-embedqa-e5-v5 or local hashing fallback"]
+        ACTION_EMBED --> BACKEND_CHECK{"Embedding backend matches<br/>stored vector backend?"}
+        BACKEND_CHECK -->|"No"| REBUILD["Re-ingest internal policy corpus<br/>for active embedding backend"]
+        REBUILD --> POLICY_STORE
+        BACKEND_CHECK -->|"Yes"| POLICY_STORE["Search internal policy embeddings<br/>storage/policy_vectors.npz<br/>cosine similarity · top 6 sections"]
+
+        POLICY_STORE --> CITATIONS["Persist citations + retrieval audit event"]
+        CITATIONS --> CONTROLS["Compliance controls<br/>deterministic thresholds, access classes, blocked actions"]
+        CONTROLS --> COMPLIANCE_CONTEXT["Context: structured request + deterministic decision<br/>+ retrieved policy excerpts"]
+        COMPLIANCE_CONTEXT --> COMPLIANCE_MODEL["Compliance rationale agent<br/>REASONING_MODEL: nvidia/llama-3.3-nemotron-super-49b-v1.5"]
+        COMPLIANCE_MODEL --> POLICY_CHECKED["POLICY_CHECKED<br/>risk: low / medium / high"]
+
+        POLICY_CHECKED --> APPROVALS["Approval router<br/>deterministic spend, legal, security, DPO,<br/>and business-owner rules"]
+        APPROVALS --> DOCUMENTS["Documents<br/>summaries deterministic; NDA draft uses FAST_MODEL if needed"]
+        DOCUMENTS --> TOOLS["Tool execution agent<br/>Context: workflow + structured request + controls"]
+        TOOLS --> TOOL_GATE{"Per-tool safety gate"}
+        TOOL_GATE -->|"Safe request / ticket"| SAFE["Execute mock wrapper tools<br/>Jira · ServiceNow · SAP Ariba · DocuSign · Okta · Slack"]
+        TOOL_GATE -->|"High risk / human-only"| BLOCKED_TOOL["Record blocked tool call<br/>No effect executed"]
+        SAFE --> AUDIT["Persist documents, citations,<br/>tool calls, and audit timeline"]
+        BLOCKED_TOOL --> AUDIT
+        AUDIT --> APPROVAL_CHECK{"Required approvals?"}
+        APPROVAL_CHECK -->|"None"| COMPLETED["COMPLETED"]
+        APPROVAL_CHECK -->|"Required"| PENDING["APPROVALS_PENDING<br/>human approval inbox"]
+        PENDING -->|"Any rejection"| REJECTED["REJECTED"]
+        PENDING -->|"All approved"| APPROVED["APPROVED → COMPLETED<br/>Blocked high-risk tools are never auto-retried"]
+    end
+
+    INJECTED["Optional vendor-supplied document"] --> RETRIEVAL_RAIL{"Retrieval / injection rail"}
+    RETRIEVAL_RAIL --> INJECTION_AUDIT["Flag suspicious instruction-like text as data<br/>Never use it as a model instruction"]
+    INJECTION_AUDIT --> DRAFT
+```
+
+---
+
 ## Why this is more than a chatbot
 
 The agent **acts, but safely.** It automatically reads policy, extracts structured request data, drafts documents, creates mock Jira / ServiceNow / SAP Ariba / DocuSign / Okta / Slack tickets, routes approvals, and produces an audit trail.
@@ -50,7 +119,7 @@ Consequences of this design:
 
 ### 4. Deterministic compliance, risk & approval routing
 - **Risk** (`low` / `medium` / `high`) from spend value (only when the profile is spend-gated), plus sensitive/high-risk access classes.
-- **Approver matrix** (INR): >₹2L → Department Head, >₹5L → Finance Manager, >₹10L → Finance + CFO; plus Legal Reviewer (NDA), Security Reviewer (any access), Data Protection Officer (customer PII/analytics), Business Owner (vendor onboarding only).
+- **Approver matrix** (INR): >₹2L → Department Head, >₹5L → Finance Manager, >₹10L → Finance + CFO; plus Legal Reviewer (NDA or vendor contracts above ₹5L), Security Reviewer (any access), Data Protection Officer (customer PII/analytics), Business Owner (vendor onboarding only).
 - The machine-actionable decision is deterministic; the LLM adds a **grounded natural-language rationale** citing retrieved policy.
 
 ### 5. Guardrails — three programmable rails
@@ -73,7 +142,7 @@ Consequences of this design:
 Workflows with required approvals hold at `APPROVALS_PENDING`; a manager approves/rejects via the Approval inbox and the workflow resumes. Every decision, citation, document, and tool call is persisted to SQLite and replayable as an ordered audit timeline.
 
 ### 8. Runs with or without a network
-If `NVIDIA_API_KEY` is absent, the LLM gateway falls back to deterministic offline stubs (including a hashing embedder), so the governance logic is always demoable.
+If `NVIDIA_API_KEY` is absent—or NVIDIA NIM is temporarily unavailable—the gateway uses deterministic local fallbacks. Retrieval uses a 1024-dimensional hashing embedder, intake uses conservative fact extraction, and policy Q&A returns the best matching retrieved policy excerpt. Governance controls, approval routing, and tool safety remain available.
 
 ---
 
@@ -103,7 +172,7 @@ Q&A path: ANSWERED (no workflow record)
 ### NVIDIA stack mapping
 - **LLM inference** → NVIDIA **NIM** (`https://integrate.api.nvidia.com/v1`, OpenAI-compatible), free developer tier.
 - **Model routing** → fast model for classification/forms (`meta/llama-3.1-8b-instruct`), strong Nemotron for compliance reasoning & Q&A (`nvidia/llama-3.3-nemotron-super-49b-v1.5`, run with *detailed thinking off* + bounded timeouts for low latency). See `app/config.py` / `app/llm_gateway.py`.
-- **Retrieval** → NVIDIA **`nv-embedqa-e5-v5`** (1024-dim) embeddings + a local numpy cosine store (`app/rag.py`).
+- **Retrieval** → NVIDIA **`nv-embedqa-e5-v5`** (1024-dim) embeddings + a local NumPy cosine store (`app/rag.py`). The store records whether vectors were produced by NIM or the local fallback and rebuilds automatically when the active embedding backend changes, preventing mismatched-vector retrieval.
 - **Guardrails** → NeMo-Guardrails-style programmable rails, implemented deterministically (`app/guardrails.py`).
 - **Enterprise systems** → all **mocked** locally (`app/mock_services.py`) with **dummy credentials** (`data/credentials/`).
 
@@ -161,7 +230,11 @@ Open **http://127.0.0.1:8000**. The real NVIDIA API key lives in `.env` (`NVIDIA
 .venv/Scripts/python -m evals.run_eval
 ```
 
-17 regression cases in `data/sample_requests/cases.jsonl` assert: workflow-status accuracy, correct workflow-type classification, required-approval routing, **no over-asking** on low-touch requests (`expect_no_approvers`/`expect_type`/`expect_tools`), Q&A routing + grounded-answer content, blocked-action safety, and prompt-injection block rate. Current suite: **17/17 pass.**
+21 regression cases in `data/sample_requests/cases.jsonl` assert: workflow-status accuracy, correct workflow-type classification, required-approval routing, **no over-asking** on low-touch requests (`expect_no_approvers`/`expect_type`/`expect_tools`), Q&A routing + grounded-answer content, blocked-action safety, prompt-injection handling, data-protection approval, and production-access blocking. Run the suite with:
+
+```bat
+.venv/Scripts/python -m evals.run_eval
+```
 
 ---
 

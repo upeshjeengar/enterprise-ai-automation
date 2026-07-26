@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from . import config
-from .llm_gateway import embed
+from .llm_gateway import embed, embedding_backend
 
 
 @dataclass
@@ -71,6 +71,7 @@ def ingest() -> int:
         config.VECTOR_PATH,
         vectors=mat,
         meta=np.array([list(asdict(c).values()) for c in chunks], dtype=object),
+        embedding_backend=np.array(embedding_backend()),
     )
     return len(chunks)
 
@@ -81,6 +82,7 @@ class PolicyStore:
     def __init__(self) -> None:
         self.vectors: np.ndarray | None = None
         self.chunks: list[Chunk] = []
+        self.embedding_backend = "unknown"
         self._load()
 
     def _load(self) -> None:
@@ -88,6 +90,8 @@ class PolicyStore:
             return
         data = np.load(config.VECTOR_PATH, allow_pickle=True)
         self.vectors = data["vectors"]
+        if "embedding_backend" in data.files:
+            self.embedding_backend = str(data["embedding_backend"].item())
         self.chunks = [
             Chunk(policy_name=row[0], section=row[1], text=row[2])
             for row in data["meta"]
@@ -101,6 +105,13 @@ class PolicyStore:
         if not self.ready:
             return []
         qv = np.array(embed([query], input_type="query")[0], dtype=np.float32)
+        # NIM and the deterministic fallback do not share a vector space. If
+        # the active backend changed (for example, NIM became unavailable),
+        # rebuild the local corpus before ranking so retrieval remains valid.
+        if self.embedding_backend != embedding_backend():
+            ingest()
+            self._load()
+            qv = np.array(embed([query], input_type="query")[0], dtype=np.float32)
         qn = np.linalg.norm(qv) or 1.0
         qv = qv / qn
         sims = self.vectors @ qv  # cosine (both normalized)
