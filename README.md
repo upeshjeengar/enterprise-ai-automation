@@ -1,5 +1,7 @@
-# CompliFlow Lite
+# Mutli-agentic AI Workflow automation system for enterprises
+In layman terms this is a chatbot which can help internal users of enterprise to raise the request for tools(instead of manual service now ticket raising; for new employees it is difficult for them whom to reach out for various specific services so user will say this in nautral language and rest work is on the Agents), create contracts for the clients from natural language instructions by employee(AI system will send approval request to all responsible persons on the basis of internal policies) and it can also work as QA bot for internal policies with help of LLM Grounding. 
 
+See it in action: https://enterprise-chatbot-1-e06a.onrender.com/ (can take a minute to start⏳, but will run smoothly after that). 
 **A governed, multi-agent enterprise workflow automation system** built on NVIDIA's agentic-AI stack shape (NIM inference, embeddings-based RAG, programmable guardrails, supervisor-style multi-agent orchestration) against **fully mocked enterprise systems** and **dummy credentials**.
 
 It turns a plain-English employee request into a **governed, auditable workflow** — or, when the message is just a question, into a **grounded policy answer**. The same pipeline handles everything from a one-line Slack notification to a ₹14-lakh vendor onboarding, and it decides *how much governance to apply based on what was actually asked* — not a one-size-fits-all template.
