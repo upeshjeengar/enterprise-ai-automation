@@ -1,4 +1,4 @@
-# Mutli-agentic AI Workflow automation system for enterprises
+# Agentic AI Workflow automation system for enterprises
 In layman terms this is a chatbot which can help internal users of enterprise to raise the request for tools(instead of searching where to go and then a manual servicenow ticket raising, employee will say I want access of this request in nautral language and rest work is on the Agents along with sending approvals to appropriate stakeholders), create contracts for the clients from natural language instructions by employee(AI system will send approval request to all responsible persons on the basis of internal policies) and it can also work as QA bot for internal policies with help of LLM Grounding. 
 
 See it in action: https://enterprise-chatbot-1-e06a.onrender.com/ (can take a minute to start⏳, but will run smoothly after that). 
